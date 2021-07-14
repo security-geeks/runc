@@ -12,6 +12,7 @@ import (
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
 	selinux "github.com/opencontainers/selinux/go-selinux"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -23,13 +24,13 @@ func New() Validator {
 	return &ConfigValidator{}
 }
 
-type ConfigValidator struct {
-}
+type ConfigValidator struct{}
 
 type check func(config *configs.Config) error
 
 func (v *ConfigValidator) Validate(config *configs.Config) error {
 	checks := []check{
+		v.cgroups,
 		v.rootfs,
 		v.network,
 		v.hostname,
@@ -45,10 +46,15 @@ func (v *ConfigValidator) Validate(config *configs.Config) error {
 			return err
 		}
 	}
-	if err := v.cgroups(config); err != nil {
-		return err
+	// Relaxed validation rules for backward compatibility
+	warns := []check{
+		v.mounts, // TODO (runc v1.x.x): make this an error instead of a warning
 	}
-
+	for _, c := range warns {
+		if err := c(config); err != nil {
+			logrus.WithError(err).Warnf("invalid configuration")
+		}
+	}
 	return nil
 }
 
@@ -246,16 +252,26 @@ func (v *ConfigValidator) cgroups(config *configs.Config) error {
 	return nil
 }
 
+func (v *ConfigValidator) mounts(config *configs.Config) error {
+	for _, m := range config.Mounts {
+		if !filepath.IsAbs(m.Destination) {
+			return fmt.Errorf("invalid mount %+v: mount destination not absolute", m)
+		}
+	}
+
+	return nil
+}
+
 func isHostNetNS(path string) (bool, error) {
 	const currentProcessNetns = "/proc/self/ns/net"
 
 	var st1, st2 unix.Stat_t
 
 	if err := unix.Stat(currentProcessNetns, &st1); err != nil {
-		return false, fmt.Errorf("unable to stat %q: %s", currentProcessNetns, err)
+		return false, &os.PathError{Op: "stat", Path: currentProcessNetns, Err: err}
 	}
 	if err := unix.Stat(path, &st2); err != nil {
-		return false, fmt.Errorf("unable to stat %q: %s", path, err)
+		return false, &os.PathError{Op: "stat", Path: path, Err: err}
 	}
 
 	return (st1.Dev == st2.Dev) && (st1.Ino == st2.Ino), nil
